@@ -20,22 +20,31 @@ jobs:
           i="$(awk -F '\t' '$1~/(^infra$|-infra$|\.infra$)/{print;exit}' /tmp/repos)"
           test -n "$i" || { echo "No production infra visible; configure TEST_FLEET_GITHUB_TOKEN or add the canonical *-infra repo" >&2; exit 1; }
           r="${i%%$'\t'*}"; b="${i#*$'\t'}"; s="$(gh api "repos/$p/$r/commits/$b" --jq .sha)"
+          echo "Testing ${p}/${r}@${s}"
           gh repo clone "$p/$r" .deps/infra -- --depth=1 --branch "$b"
           test "$(git -C .deps/infra rev-parse HEAD)" = "$s"
-      - name: Test 2 - modules-first environment and state boundaries are coherent
+          printf '%s\n' "$s" >/tmp/infra-sha
+      - name: Test 2 - declared Terraform layout and state boundaries are coherent
         shell: bash
         run: |
           set -euo pipefail
           root=.deps/infra
+          tf="$(find "$root" -type f -name '*.tf' -print | head -n 1 || true)"
           if [[ -f "$root/.ores-infra.toml" ]]; then
-            grep -Eq '^layout[[:space:]]*=[[:space:]]*"modules"' "$root/.ores-infra.toml"
-            grep -Eq '^modules_root[[:space:]]*=[[:space:]]*"modules"' "$root/.ores-infra.toml"
-            grep -Eq '^environments_root[[:space:]]*=[[:space:]]*"environments"' "$root/.ores-infra.toml"
-            for e in preview staging production; do test -d "$root/environments/$e"; done
+            echo "Found .ores-infra.toml; enforcing declared modules-first layout."
+            grep -Eq '^layout[[:space:]]*=[[:space:]]*"modules"' "$root/.ores-infra.toml" || { echo "layout must be modules" >&2; exit 1; }
+            grep -Eq '^modules_root[[:space:]]*=[[:space:]]*"modules"' "$root/.ores-infra.toml" || { echo "modules_root must be modules" >&2; exit 1; }
+            grep -Eq '^environments_root[[:space:]]*=[[:space:]]*"environments"' "$root/.ores-infra.toml" || { echo "environments_root must be environments" >&2; exit 1; }
+            for e in preview staging production; do test -d "$root/environments/$e" || { echo "missing environments/$e" >&2; exit 1; }; done
+          elif [[ -n "$tf" ]]; then
+            echo "Terraform detected at ${tf#${root}/}; enforcing canonical modules/ + environments/ layout."
+            test -d "$root/modules" || { echo "Terraform repo is missing modules/" >&2; exit 1; }
+            test -d "$root/environments" || { echo "Terraform repo is missing environments/" >&2; exit 1; }
           else
-            test -d "$root/modules"
+            echo "Production infra is not Terraform-backed; skipping Terraform-only layout assertions."
           fi
-          ! find "$root" -type f \( -name 'terraform.tfstate' -o -name 'terraform.tfstate.backup' -o -name '*.pem' -o -name '*.key' \) -print -quit | grep -q .
+          bad="$(find "$root" -path "$root/.git" -prune -o -type f \( -name 'terraform.tfstate' -o -name 'terraform.tfstate.backup' -o -name '*.pem' -o -name '*.key' \) -print | head -n 20 || true)"
+          if [[ -n "$bad" ]]; then printf 'Forbidden tracked state/key material:\n%s\n' "$bad" >&2; exit 1; fi
       - name: Test 3 - Terraform current-tip environments initialize and validate
         shell: bash
         run: |
@@ -51,5 +60,5 @@ jobs:
             fi
           done
           if [[ "$n" -eq 0 ]]; then
-            if find "$root" -name '*.tf' -print -quit | grep -q .; then terraform fmt -check -recursive "$root"; else echo "No Terraform roots yet; exact checkout/layout assertions still ran."; fi
+            if find "$root" -path "$root/.git" -prune -o -name '*.tf' -print -quit | grep -q .; then terraform fmt -check -recursive "$root"; else echo "No Terraform roots; checkout and state-boundary assertions still ran at $(cat /tmp/infra-sha)."; fi
           fi
